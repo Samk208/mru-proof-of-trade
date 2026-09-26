@@ -24,12 +24,13 @@ The merchant's device runs a zero-knowledge circuit over her private weekly tota
 the terms hold, a proof is accepted on-chain and the public ledger records:
 
 ```
-merchant pseudonym  ->  { threshold: 25,000,000, weeklyMinimum: 1,500,000 }
+merchant pseudonym (for this lender)  ->  { threshold: 25,000,000, weeklyMinimum: 1,500,000 }
 ```
 
 That is all anyone else learns: not the weekly figures, not the total, not the margin by which she
 qualified, not her identity. The lender checks the pseudonym the merchant gives them against the
-ledger.
+ledger. The pseudonym is different for every lender, so two lenders (or anyone watching the chain)
+cannot tell that they are dealing with the same merchant.
 
 ## How Midnight is used
 
@@ -38,7 +39,7 @@ ledger.
 | **Witnesses (private inputs)** | `weeklySales()`, `merchantSecret()` in [`contracts/proof-of-trade.compact`](contracts/proof-of-trade.compact), supplied by [`contracts/witnesses.ts`](contracts/witnesses.ts) | The 12 weekly totals and the merchant secret never leave the merchant's private state store. |
 | **Circuit assertions over private data** | `assert(week >= weeklyMinimum)` for every week, `assert(total >= threshold)` | The rules are enforced inside the ZK proof. A merchant who doesn't meet them cannot produce a valid transaction at all. |
 | **Selective disclosure with `disclose()`** | Only the pseudonym and the terms are disclosed | The compiler forces every private-to-public flow to be explicit, so it is auditable that no sales figure is published. |
-| **Pure circuit for a pseudonym** | `merchantId(secret)` = `persistentHash("mru:proof-of-trade:merchant", secret)` | A stable identifier the merchant can hand to a lender, unlinkable to her real identity or wallet. |
+| **Pure circuit for a pseudonym** | `merchantId(secret, lender)` = `persistentHash([pad(32, "mru:proof-of-trade:merchant:v1"), secret, lender])` | A per-lender identifier the merchant hands to that lender. It is unlinkable to her identity, her wallet, and her pseudonyms with other lenders. The secret is 32 random bytes, so the hash can't be brute-forced; the tag is versioned and domain-separated. |
 | **Public ledger state** | `attestations: Map<Bytes<32>, Attestation>`, `proofsIssued: Counter` | Anyone can verify an attestation; nobody can read the underlying data. |
 
 ## Run it
@@ -81,17 +82,33 @@ yarn env:down
    circuit ("Sales total is below the threshold"). No transaction, no ledger change.
 4. **Moussa is refused.** He has a bigger total (34.43M GNF), but his kiosk was shut for one week
    (400,000 GNF). The circuit refuses ("A week fell below the minimum").
-5. **Moussa qualifies for terms that fit his record** (20M total, 400k weekly minimum). A lender
-   offering a smaller loan can still serve him, again without seeing his sales.
+5. **Moussa qualifies with another lender** (a tontine offering 20M total, 400k weekly minimum). A
+   lender offering a smaller loan can still serve him, again without seeing his sales.
+6. **Two lenders can't link her.** Aminata also proves terms to the tontine. The ledger now holds two
+   attestations for her under two different pseudonyms; nothing connects them.
 
 ```
 ✓ deploys with an empty attestation registry
 ✓ a qualifying merchant proves the loan terms without revealing her sales
 ✓ cannot prove a threshold above the real sales total
 ✓ a merchant with one week below the minimum cannot get an attestation
-✓ the same merchant can qualify for smaller terms that match his record
-Tests  5 passed (5)
+✓ the same merchant can qualify with another lender on terms that match his record
+✓ two lenders see unlinkable pseudonyms for the same merchant
+Tests  6 passed (6)
 ```
+
+## Security and privacy notes
+
+Checked against Midnight's [smart contract security guidance](https://docs.midnight.network/compact/smart-contract-security):
+
+- **Witnesses are untrusted.** Everything the contract relies on is re-checked by assertions inside the circuit.
+- **Minimal, late disclosure.** `disclose()` wraps only the pseudonym and the terms, at the point where they are written to the ledger.
+- **No `ownPublicKey()` for identity.** Identity comes from a secret that only the merchant holds.
+- **Pseudonyms can't be brute-forced or linked.** They are domain-separated, versioned, per-lender hashes of a 32-byte random secret.
+- **Assertion messages name no week and no figure.** A failed proof never produces a transaction, so a refusal leaves no on-chain trace.
+- **No overflow.** 12 × (2³² − 1) < 2³⁶, so the 64-bit total cannot overflow.
+- **Dependencies are clean.** `yarn audit` reports 0 vulnerabilities, with patched versions pinned via `resolutions`.
+- **No secrets in the repo.** The only key-like values are Midnight's public local-dev seed and the compose defaults for a local-only stack.
 
 ## Honest limits and next step
 

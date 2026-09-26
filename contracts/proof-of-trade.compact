@@ -3,38 +3,46 @@ pragma language_version >= 0.16;
 import CompactStandardLibrary;
 
 // A merchant proves "my last 12 weeks of sales total at least `threshold`, and no
-// week fell below `weeklyMinimum`" without revealing a single sales figure.
-// The sales vector and the merchant's secret stay in private state on the
-// merchant's device; only the attestation below reaches the public ledger.
+// week fell below `weeklyMinimum`" to a specific lender, without revealing a single
+// sales figure. The sales vector and the merchant's secret stay in private state on
+// the merchant's device; only the attestation below reaches the public ledger.
 
 export struct Attestation {
   threshold: Uint<64>;
   weeklyMinimum: Uint<32>;
 }
 
-// Private inputs, supplied by the merchant's wallet (from the MRU sales ledger).
+// Private inputs, supplied by the merchant's device (from the MRU sales ledger).
+// Witnesses are prover-supplied and untrusted: everything the contract relies on is
+// re-checked by the assertions in proveTrade.
 witness weeklySales(): Vector<12, Uint<32>>;
 witness merchantSecret(): Bytes<32>;
 
-// Public state: merchant pseudonym -> the strongest claim proven so far.
+// Public state: per-lender merchant pseudonym -> the terms that merchant has proven.
 export ledger attestations: Map<Bytes<32>, Attestation>;
 export ledger proofsIssued: Counter;
 
-export pure circuit merchantId(secret: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "mru:proof-of-trade:merchant"), secret]);
+// Pseudonym for one merchant as seen by one lender. Including the lender makes the
+// pseudonyms of the same merchant unlinkable across lenders. The secret is 32 random
+// bytes, so the hash cannot be brute-forced back to the merchant.
+export pure circuit merchantId(secret: Bytes<32>, lender: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "mru:proof-of-trade:merchant:v1"), secret, lender]);
 }
 
-export circuit proveTrade(threshold: Uint<64>, weeklyMinimum: Uint<32>): [] {
+export circuit proveTrade(lender: Bytes<32>, threshold: Uint<64>, weeklyMinimum: Uint<32>): [] {
   const sales = weeklySales();
 
+  // Messages never name a week or a figure; a failed proof is never submitted on-chain.
   for (const week of sales) {
     assert(week >= weeklyMinimum, "A week fell below the minimum");
   }
 
+  // 12 x (2^32 - 1) < 2^36, so the 64-bit running total cannot overflow.
   const total = fold((acc: Uint<64>, week: Uint<32>): Uint<64> => (acc + week) as Uint<64>, 0 as Uint<64>, sales);
   assert(total >= threshold, "Sales total is below the threshold");
 
-  const id = merchantId(merchantSecret());
+  // The only disclosures: the pseudonym and the terms that were proven.
+  const id = merchantId(merchantSecret(), lender);
   attestations.insert(disclose(id), disclose(Attestation { threshold: threshold, weeklyMinimum: weeklyMinimum }));
   proofsIssued.increment(1);
 }

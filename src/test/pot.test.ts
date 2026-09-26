@@ -18,7 +18,7 @@ import {
   zkConfigPath,
   type MerchantPrivateState,
 } from '../../contracts/index.js';
-import { AMINATA, MOUSSA, LOAN_OFFER, total } from '../demo-data.js';
+import { AMINATA, MOUSSA, LENDER_A, LENDER_B, LOAN_OFFER, total } from '../demo-data.js';
 
 // @ts-expect-error WebSocket global assignment for apollo
 globalThis.WebSocket = WebSocket;
@@ -41,18 +41,24 @@ describe('MRU Proof of Trade (local)', () => {
     return ledger(state!.data);
   };
 
-  const prove = (merchant: MerchantPrivateState, threshold: bigint, weeklyMinimum: bigint) =>
+  const prove = (
+    merchant: MerchantPrivateState,
+    lender: Uint8Array,
+    threshold: bigint,
+    weeklyMinimum: bigint,
+  ) =>
     providers.privateStateProvider.set(MERCHANT_STATE, merchant).then(() =>
       (submitCallTx<Contract, 'proveTrade'>)(providers, {
         compiledContract: CompiledProofOfTradeContract,
         contractAddress,
         privateStateId: MERCHANT_STATE,
         circuitId: 'proveTrade',
-        args: [threshold, weeklyMinimum],
+        args: [lender, threshold, weeklyMinimum],
       }),
     );
 
-  const idOf = (m: MerchantPrivateState) => pureCircuits.merchantId(hexToBytes(m.secretHex));
+  const idOf = (m: MerchantPrivateState, lender: Uint8Array) =>
+    pureCircuits.merchantId(hexToBytes(m.secretHex), lender);
 
   beforeAll(async () => {
     setNetworkId(config.networkId);
@@ -93,12 +99,11 @@ describe('MRU Proof of Trade (local)', () => {
   it('a qualifying merchant proves the loan terms without revealing her sales', async () => {
     expect(total(AMINATA)).toBeGreaterThanOrEqual(LOAN_OFFER.threshold); // sanity on the sample
 
-    await prove(AMINATA, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum);
+    await prove(AMINATA, LENDER_A, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum);
 
     const state = await readLedger();
     expect(state.proofsIssued).toBe(1n);
-    expect(state.attestations.member(idOf(AMINATA))).toBe(true);
-    expect(state.attestations.lookup(idOf(AMINATA))).toEqual({
+    expect(state.attestations.lookup(idOf(AMINATA, LENDER_A))).toEqual({
       threshold: LOAN_OFFER.threshold,
       weeklyMinimum: LOAN_OFFER.weeklyMinimum,
     });
@@ -116,32 +121,49 @@ describe('MRU Proof of Trade (local)', () => {
 
   it('cannot prove a threshold above the real sales total', async () => {
     const tooHigh = total(AMINATA) + 1n;
-    await expect(prove(AMINATA, tooHigh, LOAN_OFFER.weeklyMinimum)).rejects.toThrow(
+    await expect(prove(AMINATA, LENDER_A, tooHigh, LOAN_OFFER.weeklyMinimum)).rejects.toThrow(
       /Sales total is below the threshold/,
     );
 
     const state = await readLedger();
     expect(state.proofsIssued).toBe(1n);
-    expect(state.attestations.lookup(idOf(AMINATA)).threshold).toBe(LOAN_OFFER.threshold);
+    expect(state.attestations.lookup(idOf(AMINATA, LENDER_A)).threshold).toBe(LOAN_OFFER.threshold);
   });
 
   it('a merchant with one week below the minimum cannot get an attestation', async () => {
     expect(total(MOUSSA)).toBeGreaterThanOrEqual(LOAN_OFFER.threshold); // big total, one bad week
 
-    await expect(prove(MOUSSA, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum)).rejects.toThrow(
-      /A week fell below the minimum/,
-    );
+    await expect(
+      prove(MOUSSA, LENDER_A, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum),
+    ).rejects.toThrow(/A week fell below the minimum/);
 
     const state = await readLedger();
-    expect(state.attestations.member(idOf(MOUSSA))).toBe(false);
+    expect(state.attestations.member(idOf(MOUSSA, LENDER_A))).toBe(false);
     expect(state.proofsIssued).toBe(1n);
   });
 
-  it('the same merchant can qualify for smaller terms that match his record', async () => {
-    await prove(MOUSSA, 20_000_000n, 400_000n);
+  it('the same merchant can qualify with another lender on terms that match his record', async () => {
+    await prove(MOUSSA, LENDER_B, 20_000_000n, 400_000n);
 
     const state = await readLedger();
     expect(state.proofsIssued).toBe(2n);
-    expect(state.attestations.lookup(idOf(MOUSSA))).toEqual({ threshold: 20_000_000n, weeklyMinimum: 400_000n });
+    expect(state.attestations.lookup(idOf(MOUSSA, LENDER_B))).toEqual({
+      threshold: 20_000_000n,
+      weeklyMinimum: 400_000n,
+    });
+  });
+
+  it('two lenders see unlinkable pseudonyms for the same merchant', async () => {
+    await prove(AMINATA, LENDER_B, 20_000_000n, 1_000_000n);
+
+    const toLenderA = idOf(AMINATA, LENDER_A);
+    const toLenderB = idOf(AMINATA, LENDER_B);
+    expect(Buffer.from(toLenderA).equals(Buffer.from(toLenderB))).toBe(false);
+
+    const state = await readLedger();
+    expect(state.proofsIssued).toBe(3n);
+    expect(state.attestations.size()).toBe(3n);
+    expect(state.attestations.lookup(toLenderA).threshold).toBe(LOAN_OFFER.threshold);
+    expect(state.attestations.lookup(toLenderB).threshold).toBe(20_000_000n);
   });
 });
