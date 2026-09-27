@@ -124,7 +124,9 @@ Tests  9 passed (9)
 | Proof of the source session (zkTLS) | prove data straight from the operator's API session | A future option if operators won't publish commitments |
 
 The operator is trusted to record true takings, which it already does as the payment rail. It
-learns nothing about which lender a merchant approaches, or what she proved.
+learns nothing about which lender a merchant approaches, or what she proved, provided onboarding
+gives the operator only her owner key, `ownerKey(secret)`, and never the secret itself. (The demo
+builds both roles in one process for brevity; see Limits.)
 
 ## Security and privacy notes
 
@@ -147,6 +149,21 @@ Checked against Midnight's [smart contract security guidance](https://docs.midni
 - **One operator key.** A production version would hold a set of licensed operators, with key rotation.
 - **One attestation per pseudonym.** A new proof overwrites the old one, so a merchant keeps her
   latest claim with each lender.
+- **The lender must bind the proof to the applicant.** Attestations are public, so a pseudonym
+  alone does not show that the person applying owns it. The fix needs no contract change: the
+  lender issues a fresh id per application, e.g. `lender = hash(lenderId, applicationNonce)`, and
+  only accepts an attestation under that id. Only the holder of the merchant secret can produce it.
+- **Unlinkability cuts both ways.** Because lenders cannot link a merchant across lenders, one
+  operator record can back loans from several lenders at once. A shared, still-private
+  "record already pledged" check (a per-record nullifier) is the next piece of the design.
+- **No revocation.** The historic Merkle tree keeps every past root valid, so a record the
+  operator later finds wrong cannot be withdrawn. A revocation set checked in-circuit would close this.
+- **Onboarding must keep the merchant secret on her device.** The operator needs only
+  `ownerKey(secret)` to build her record. In the demo, `leafFor` derives it from the secret
+  because both roles run in one test process.
+- **The fee-paying wallet is a linking channel.** The demo submits every transaction from one
+  local wallet. In production each merchant should pay from her own wallet, kept separate from
+  any identity a lender sees, or the transaction metadata could link her pseudonyms.
 - **Runs on a local network in this repo.** Deploying to Midnight Preprod needs a funded tDUST wallet
   (see `.env.preprod.example`); the contract and code are unchanged.
 
