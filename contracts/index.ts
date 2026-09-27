@@ -9,6 +9,7 @@ export {
   pureCircuits,
   type Ledger,
   type Attestation,
+  type SalesRecord,
 } from './managed/proof-of-trade/contract/index.js';
 export * from './witnesses.js';
 

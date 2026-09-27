@@ -15,17 +15,28 @@ import {
   ledger,
   pureCircuits,
   hexToBytes,
+  leafFor,
   zkConfigPath,
-  type MerchantPrivateState,
+  type MerchantState,
+  type PrivateState,
 } from '../../contracts/index.js';
-import { AMINATA, MOUSSA, LENDER_A, LENDER_B, LOAN_OFFER, total } from '../demo-data.js';
+import {
+  AMINATA,
+  MOUSSA,
+  LENDER_A,
+  LENDER_B,
+  LOAN_OFFER,
+  OPERATOR_SECRET,
+  PERIOD_END,
+  total,
+} from '../demo-data.js';
 
 // @ts-expect-error WebSocket global assignment for apollo
 globalThis.WebSocket = WebSocket;
 
 // Local dev-chain funded seed (same one the upstream example uses). Local only.
 const LOCAL_SEED = '0000000000000000000000000000000000000000000000000000000000000001';
-const MERCHANT_STATE = 'merchantPrivateState';
+const STATE_ID = 'proofOfTradePrivateState';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info', transport: { target: 'pino-pretty' } });
 
@@ -41,23 +52,33 @@ describe('MRU Proof of Trade (local)', () => {
     return ledger(state!.data);
   };
 
-  const prove = (
-    merchant: MerchantPrivateState,
-    lender: Uint8Array,
-    threshold: bigint,
-    weeklyMinimum: bigint,
-  ) =>
-    providers.privateStateProvider.set(MERCHANT_STATE, merchant).then(() =>
-      (submitCallTx<Contract, 'proveTrade'>)(providers, {
-        compiledContract: CompiledProofOfTradeContract,
-        contractAddress,
-        privateStateId: MERCHANT_STATE,
-        circuitId: 'proveTrade',
-        args: [lender, threshold, weeklyMinimum],
-      }),
-    );
+  // Each call runs as one party: set that party's private state, then submit.
+  const asOperator: PrivateState = { operatorSecretHex: OPERATOR_SECRET };
+  const asMerchant = (m: MerchantState): PrivateState => ({ merchant: m });
 
-  const idOf = (m: MerchantPrivateState, lender: Uint8Array) =>
+  const recordAs = async (party: PrivateState, leaf: Uint8Array) => {
+    await providers.privateStateProvider.set(STATE_ID, party);
+    return (submitCallTx<Contract, 'recordSales'>)(providers, {
+      compiledContract: CompiledProofOfTradeContract,
+      contractAddress,
+      privateStateId: STATE_ID,
+      circuitId: 'recordSales',
+      args: [leaf],
+    });
+  };
+
+  const prove = async (m: MerchantState, lender: Uint8Array, threshold: bigint, weeklyMinimum: bigint) => {
+    await providers.privateStateProvider.set(STATE_ID, asMerchant(m));
+    return (submitCallTx<Contract, 'proveTrade'>)(providers, {
+      compiledContract: CompiledProofOfTradeContract,
+      contractAddress,
+      privateStateId: STATE_ID,
+      circuitId: 'proveTrade',
+      args: [lender, threshold, weeklyMinimum],
+    });
+  };
+
+  const idOf = (m: MerchantState, lender: Uint8Array) =>
     pureCircuits.merchantId(hexToBytes(m.secretHex), lender);
 
   beforeAll(async () => {
@@ -82,18 +103,40 @@ describe('MRU Proof of Trade (local)', () => {
     if (wallet) await wallet.stop();
   });
 
-  it('deploys with an empty attestation registry', async () => {
+  it('deploys with the operator key and an empty registry', async () => {
+    const operatorKey = pureCircuits.publicKeyOf(hexToBytes(OPERATOR_SECRET));
     const deployed = await (deployContract<Contract>)(providers, {
       compiledContract: CompiledProofOfTradeContract,
-      privateStateId: MERCHANT_STATE,
-      initialPrivateState: AMINATA,
+      privateStateId: STATE_ID,
+      initialPrivateState: asOperator,
+      args: [operatorKey],
     });
     contractAddress = deployed.deployTxData.public.contractAddress;
     logger.info(`Proof of Trade deployed at ${contractAddress}`);
 
     const state = await readLedger();
+    expect(state.operatorKey).toEqual(operatorKey);
+    expect(state.salesRecords.firstFree()).toBe(0n);
     expect(state.attestations.isEmpty()).toBe(true);
     expect(state.proofsIssued).toBe(0n);
+  });
+
+  it("the operator records merchants' weekly sales as hidden commitments", async () => {
+    await recordAs(asOperator, leafFor(AMINATA));
+    await recordAs(asOperator, leafFor(MOUSSA));
+
+    const state = await readLedger();
+    expect(state.salesRecords.firstFree()).toBe(2n);
+    expect(state.salesRecords.findPathForLeaf(leafFor(AMINATA))).toBeDefined();
+    expect(state.salesRecords.findPathForLeaf(leafFor(MOUSSA))).toBeDefined();
+  });
+
+  it('only the operator can record sales', async () => {
+    const impostor: PrivateState = { operatorSecretHex: 'ff'.repeat(32) };
+    const forged: MerchantState = { ...AMINATA, weeklySales: AMINATA.weeklySales.map((w) => w * 10) };
+
+    await expect(recordAs(impostor, leafFor(forged))).rejects.toThrow(/Only the operator can record sales/);
+    expect((await readLedger()).salesRecords.firstFree()).toBe(2n);
   });
 
   it('a qualifying merchant proves the loan terms without revealing her sales', async () => {
@@ -106,10 +149,11 @@ describe('MRU Proof of Trade (local)', () => {
     expect(state.attestations.lookup(idOf(AMINATA, LENDER_A))).toEqual({
       threshold: LOAN_OFFER.threshold,
       weeklyMinimum: LOAN_OFFER.weeklyMinimum,
+      periodEnd: BigInt(PERIOD_END),
     });
 
-    // The whole public state is one attestation (pseudonym -> terms) and a counter.
-    // No sales figure, total, or merchant secret appears anywhere in it.
+    // Public attestations hold a pseudonym and the terms only: no sales figure, total,
+    // secret, blinder, or the operator's commitment (so the record can't be linked either).
     const publicValues = JSON.stringify(
       [...state.attestations].map(([k, v]) => [Buffer.from(k).toString('hex'), v]),
       (_, v) => (typeof v === 'bigint' ? v.toString() : v),
@@ -117,6 +161,8 @@ describe('MRU Proof of Trade (local)', () => {
     for (const week of AMINATA.weeklySales) expect(publicValues).not.toContain(String(week));
     expect(publicValues).not.toContain(total(AMINATA).toString());
     expect(publicValues).not.toContain(AMINATA.secretHex);
+    expect(publicValues).not.toContain(AMINATA.blinderHex);
+    expect(publicValues).not.toContain(Buffer.from(leafFor(AMINATA)).toString('hex'));
   });
 
   it('cannot prove a threshold above the real sales total', async () => {
@@ -130,12 +176,29 @@ describe('MRU Proof of Trade (local)', () => {
     expect(state.attestations.lookup(idOf(AMINATA, LENDER_A)).threshold).toBe(LOAN_OFFER.threshold);
   });
 
+  it("edited sales figures fail: they no longer match the operator's record", async () => {
+    // Moussa hides his bad week by typing in a better number. His real record fails the
+    // lender's weekly minimum; the edited one would pass, but the operator never recorded it.
+    const edited: MerchantState = {
+      ...MOUSSA,
+      weeklySales: MOUSSA.weeklySales.map((w) => Math.max(w, 2_000_000)),
+    };
+
+    await expect(prove(edited, LENDER_A, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum)).rejects.toThrow(
+      /Sales record not attested by operator/,
+    );
+
+    const state = await readLedger();
+    expect(state.attestations.member(idOf(MOUSSA, LENDER_A))).toBe(false);
+    expect(state.proofsIssued).toBe(1n);
+  });
+
   it('a merchant with one week below the minimum cannot get an attestation', async () => {
     expect(total(MOUSSA)).toBeGreaterThanOrEqual(LOAN_OFFER.threshold); // big total, one bad week
 
-    await expect(
-      prove(MOUSSA, LENDER_A, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum),
-    ).rejects.toThrow(/A week fell below the minimum/);
+    await expect(prove(MOUSSA, LENDER_A, LOAN_OFFER.threshold, LOAN_OFFER.weeklyMinimum)).rejects.toThrow(
+      /A week fell below the minimum/,
+    );
 
     const state = await readLedger();
     expect(state.attestations.member(idOf(MOUSSA, LENDER_A))).toBe(false);
@@ -150,6 +213,7 @@ describe('MRU Proof of Trade (local)', () => {
     expect(state.attestations.lookup(idOf(MOUSSA, LENDER_B))).toEqual({
       threshold: 20_000_000n,
       weeklyMinimum: 400_000n,
+      periodEnd: BigInt(PERIOD_END),
     });
   });
 

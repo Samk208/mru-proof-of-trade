@@ -2,47 +2,93 @@ pragma language_version >= 0.16;
 
 import CompactStandardLibrary;
 
-// A merchant proves "my last 12 weeks of sales total at least `threshold`, and no
-// week fell below `weeklyMinimum`" to a specific lender, without revealing a single
-// sales figure. The sales vector and the merchant's secret stay in private state on
-// the merchant's device; only the attestation below reaches the public ledger.
+// MRU Proof of Trade.
+//
+// 1. The mobile-money operator records a hiding commitment to each merchant's 12 weekly
+//    sales totals in an on-chain Merkle tree. Only the operator's key can add records.
+// 2. A merchant proves to a specific lender, in zero knowledge, that ONE of those
+//    operator records is hers and that it meets the lender's terms: total >= threshold
+//    and every week >= weeklyMinimum. Nobody learns the figures, or which record it was.
+// 3. The public ledger gets only a per-lender pseudonym and the terms proven.
+
+export struct SalesRecord {
+  weeks: Vector<12, Uint<32>>; // weekly totals in minor currency units, oldest first
+  periodEnd: Uint<32>;         // last day covered, as days since 1970-01-01
+  owner: Bytes<32>;            // ownerKey(merchantSecret): only this merchant can use the record
+}
 
 export struct Attestation {
   threshold: Uint<64>;
   weeklyMinimum: Uint<32>;
+  periodEnd: Uint<32>;
 }
 
-// Private inputs, supplied by the merchant's device (from the MRU sales ledger).
-// Witnesses are prover-supplied and untrusted: everything the contract relies on is
-// re-checked by the assertions in proveTrade.
-witness weeklySales(): Vector<12, Uint<32>>;
+// ---- Private inputs (prover-supplied, untrusted: every one is re-checked below) ----
+witness operatorSecret(): Bytes<32>;
+witness salesRecord(): SalesRecord;
+witness recordBlinder(): Bytes<32>;
 witness merchantSecret(): Bytes<32>;
+witness recordPath(leaf: Bytes<32>): MerkleTreePath<16, Bytes<32>>;
 
-// Public state: per-lender merchant pseudonym -> the terms that merchant has proven.
+// ---- Public state ----
+export ledger operatorKey: Bytes<32>;
+export ledger salesRecords: HistoricMerkleTree<16, Bytes<32>>;
 export ledger attestations: Map<Bytes<32>, Attestation>;
 export ledger proofsIssued: Counter;
 
-// Pseudonym for one merchant as seen by one lender. Including the lender makes the
-// pseudonyms of the same merchant unlinkable across lenders. The secret is 32 random
-// bytes, so the hash cannot be brute-forced back to the merchant.
+constructor(operator: Bytes<32>) {
+  operatorKey = disclose(operator);
+}
+
+// ---- Domain-separated, versioned hashes ----
+export pure circuit publicKeyOf(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "mru:proof-of-trade:operator:v1"), secret]);
+}
+
+export pure circuit ownerKey(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "mru:proof-of-trade:owner:v1"), secret]);
+}
+
+// Hiding commitment: without the blinder, the leaf reveals nothing about the sales.
+export pure circuit salesLeaf(record: SalesRecord, blinder: Bytes<32>): Bytes<32> {
+  return persistentCommit<SalesRecord>(record, blinder);
+}
+
+// Pseudonym for one merchant as seen by one lender; unlinkable across lenders.
 export pure circuit merchantId(secret: Bytes<32>, lender: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<3, Bytes<32>>>([pad(32, "mru:proof-of-trade:merchant:v1"), secret, lender]);
 }
 
+// ---- Operator: record a merchant's sales commitment ----
+export circuit recordSales(leaf: Bytes<32>): [] {
+  assert(publicKeyOf(operatorSecret()) == operatorKey, "Only the operator can record sales");
+  salesRecords.insert(disclose(leaf));
+}
+
+// ---- Merchant: prove the lender's terms ----
 export circuit proveTrade(lender: Bytes<32>, threshold: Uint<64>, weeklyMinimum: Uint<32>): [] {
-  const sales = weeklySales();
+  const secret = merchantSecret();
+  const record = salesRecord();
+
+  // The record must be this merchant's, and must be one the operator put on-chain.
+  assert(record.owner == ownerKey(secret), "Sales record does not belong to this merchant");
+  const leaf = salesLeaf(record, recordBlinder());
+  const path = recordPath(leaf);
+  assert(path.leaf == leaf, "Sales record not attested by operator");
+  assert(salesRecords.checkRoot(disclose(merkleTreePathRoot<16, Bytes<32>>(path))), "Sales record not attested by operator");
 
   // Messages never name a week or a figure; a failed proof is never submitted on-chain.
-  for (const week of sales) {
+  for (const week of record.weeks) {
     assert(week >= weeklyMinimum, "A week fell below the minimum");
   }
-
   // 12 x (2^32 - 1) < 2^36, so the 64-bit running total cannot overflow.
-  const total = fold((acc: Uint<64>, week: Uint<32>): Uint<64> => (acc + week) as Uint<64>, 0 as Uint<64>, sales);
+  const total = fold((acc: Uint<64>, week: Uint<32>): Uint<64> => (acc + week) as Uint<64>, 0 as Uint<64>, record.weeks);
   assert(total >= threshold, "Sales total is below the threshold");
 
-  // The only disclosures: the pseudonym and the terms that were proven.
-  const id = merchantId(merchantSecret(), lender);
-  attestations.insert(disclose(id), disclose(Attestation { threshold: threshold, weeklyMinimum: weeklyMinimum }));
+  // The only disclosures: the pseudonym, the terms, and the period the operator attested.
+  attestations.insert(
+    disclose(merchantId(secret, lender)),
+    disclose(Attestation { threshold: threshold, weeklyMinimum: weeklyMinimum, periodEnd: record.periodEnd })
+  );
   proofsIssued.increment(1);
 }
